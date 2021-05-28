@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -33,6 +34,8 @@ import (
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
+	"github.com/prometheus/exporter-toolkit/web"
+	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/ini.v1"
 
@@ -40,6 +43,7 @@ import (
 )
 
 var (
+	webConfig     = webflag.AddFlags(kingpin.CommandLine)
 	listenAddress = kingpin.Flag(
 		"web.listen-address",
 		"Address to listen on for web interface and telemetry.",
@@ -83,6 +87,7 @@ var scrapers = map[collector.Scraper]bool{
 	collector.ScrapePerfEventsWaits{}:                     false,
 	collector.ScrapePerfFileEvents{}:                      false,
 	collector.ScrapePerfFileInstances{}:                   false,
+	collector.ScrapePerfMemoryEvents{}:                    false,
 	collector.ScrapePerfReplicationGroupMembers{}:         false,
 	collector.ScrapePerfReplicationGroupMemberStats{}:     false,
 	collector.ScrapePerfReplicationApplierStatsByWorker{}: false,
@@ -112,20 +117,28 @@ func parseMycnf(config interface{}) (string, error) {
 	}
 	user := cfg.Section("client").Key("user").String()
 	password := cfg.Section("client").Key("password").String()
-	if (user == "") || (password == "") {
-		return dsn, fmt.Errorf("no user or password specified under [client] in %s", config)
+	if user == "" {
+		return dsn, fmt.Errorf("no user specified under [client] in %s", config)
 	}
 	host := cfg.Section("client").Key("host").MustString("localhost")
 	port := cfg.Section("client").Key("port").MustUint(3306)
 	socket := cfg.Section("client").Key("socket").String()
-	if socket != "" {
-		dsn = fmt.Sprintf("%s:%s@unix(%s)/", user, password, socket)
-	} else {
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/", user, password, host, port)
-	}
 	sslCA := cfg.Section("client").Key("ssl-ca").String()
 	sslCert := cfg.Section("client").Key("ssl-cert").String()
 	sslKey := cfg.Section("client").Key("ssl-key").String()
+	passwordPart := ""
+	if password != "" {
+		passwordPart = ":" + password
+	} else {
+		if sslKey == "" {
+			return dsn, fmt.Errorf("password or ssl-key should be specified under [client] in %s", config)
+		}
+	}
+	if socket != "" {
+		dsn = fmt.Sprintf("%s%s@unix(%s)/", user, passwordPart, socket)
+	} else {
+		dsn = fmt.Sprintf("%s%s@tcp(%s:%d)/", user, passwordPart, host, port)
+	}
 	if sslCA != "" {
 		if tlsErr := customizeTLS(sslCA, sslCert, sslKey); tlsErr != nil {
 			tlsErr = fmt.Errorf("failed to register a custom TLS configuration for mysql dsn: %s", tlsErr)
@@ -195,7 +208,7 @@ func newHandler(metrics collector.Metrics, scrapers []collector.Scraper, logger 
 				r = r.WithContext(ctx)
 			}
 		}
-		level.Debug(logger).Log("msg", "collect[] params", "params", params)
+		level.Debug(logger).Log("msg", "collect[] params", "params", strings.Join(params, ","))
 
 		// Check if we have some "collect[]" query parameters.
 		if len(params) > 0 {
@@ -288,7 +301,8 @@ func main() {
 	})
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
-	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
+	srv := &http.Server{Addr: *listenAddress}
+	if err := web.ListenAndServe(srv, *webConfig, logger); err != nil {
 		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
 		os.Exit(1)
 	}
